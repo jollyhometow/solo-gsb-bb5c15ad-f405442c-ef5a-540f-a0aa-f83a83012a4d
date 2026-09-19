@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 
 from sqlalchemy import (
     JSON,
@@ -157,4 +158,8 @@ class CaseState(Base):
 
 
 def init_db() -> None:
+    url = settings.DB_URL
+    if url.startswith("sqlite") and ":memory:" not in url:
+        # 确保 SQLite 文件所在目录存在（本地 ./data 或 Docker 卷 /app/data）
+        Path(url.split("///", 1)[-1]).parent.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)

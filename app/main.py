@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from contextlib import asynccontextmanager
+from dataclasses import replace
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
@@ -259,14 +260,15 @@ def replay_preview(
         if existing is None:
             merged_keys[r.ts] = Sample(ts=r.ts, temperature=r.temperature, humidity=r.humidity)
         else:
+            # Sample 不可变：在内存副本上按 report_count 逐条累计均值，
+            # 与入库合并规则一致；库内读数、快照与版本号均不受影响
             total = existing.report_count + 1
-            existing.temperature = (
-                existing.temperature * existing.report_count + r.temperature
-            ) / total
-            existing.humidity = (
-                existing.humidity * existing.report_count + r.humidity
-            ) / total
-            existing.report_count = total
+            merged_keys[r.ts] = replace(
+                existing,
+                temperature=(existing.temperature * existing.report_count + r.temperature) / total,
+                humidity=(existing.humidity * existing.report_count + r.humidity) / total,
+                report_count=total,
+            )
         added += 1
 
     anchor_set = set(services._load_anchor_ts(db, device_sn))

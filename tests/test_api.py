@@ -326,3 +326,99 @@ def test_preview_identical_when_no_change(client):
     assert body["changed"] is False
     assert body["would_bump_version"] is False
     assert body["affected_from_ts"] is None
+
+
+def test_preview_merges_duplicate_of_stored_reading(client, db):
+    # 库内 08:00 被上报两次（合并为均值 21.0/57.5，report_count=2），
+    # 另有 08:10 / 08:20 / 08:30 三条平稳读数
+    client.post("/api/v1/readings/batch", json={"readings": [
+        _reading("CASE-D", "2026-09-01T08:00:00+08:00", 20.0, 55.0),
+        _reading("CASE-D", "2026-09-01T08:10:00+08:00", 20.0, 55.0),
+        _reading("CASE-D", "2026-09-01T08:20:00+08:00", 20.0, 55.0),
+        _reading("CASE-D", "2026-09-01T08:30:00+08:00", 20.0, 55.0),
+    ]})
+    client.post("/api/v1/readings/batch", json={"readings": [
+        _reading("CASE-D", "2026-09-01T08:00:00+08:00", 22.0, 60.0),
+    ]})
+    version_before = db.get(CaseState, "CASE-D").version
+
+    # 待预览读数与库内同设备、同时间戳重复：不得 500、不得写库
+    dup = [_reading("CASE-D", "2026-09-01T08:00:00+08:00", 26.0, 70.0)]
+    r = client.post("/api/v1/replay/preview",
+                    params={"device_sn": "CASE-D"}, json={"readings": dup})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["added_readings"] == 1
+    assert body["changed"] is True
+    assert body["affected_from_ts"] is not None
+    # 按 report_count 逐条累计均值：(21.0×2 + 26.0) / 3，再与其余三条 20.0 同段
+    assert body["preview"]["sample_count"] == 4
+    seg = body["preview"]["segments"][0]
+    assert seg["mean_temperature"] == pytest.approx(((21.0 * 2 + 26.0) / 3 + 60.0) / 4)
+    assert seg["mean_humidity"] == pytest.approx(((57.5 * 2 + 70.0) / 3 + 165.0) / 4)
+
+    # 重复预览结果稳定（分段差异确定）
+    again = client.post("/api/v1/replay/preview",
+                        params={"device_sn": "CASE-D"}, json={"readings": dup}).json()
+    assert again["preview"]["segments"] == body["preview"]["segments"]
+    assert again["affected_from_ts"] == body["affected_from_ts"]
+    assert again["affected_to_ts"] == body["affected_to_ts"]
+
+    # 库内读数、快照与版本号均未被改写
+    db.expire_all()
+    rows = db.query(Reading).filter(Reading.device_sn == "CASE-D").order_by(Reading.ts).all()
+    assert len(rows) == 4
+    assert rows[0].report_count == 2
+    assert rows[0].temperature == pytest.approx(21.0)
+    assert rows[0].humidity == pytest.approx(57.5)
+    assert db.get(CaseState, "CASE-D").version == version_before
+    stored = client.get("/api/v1/cases/CASE-D/segments").json()
+    assert stored["version"] == version_before
+    assert stored["segments"][0]["mean_temperature"] == pytest.approx((21.0 + 60.0) / 4)
+
+    # 预览应与真实入库重放结果一致（累计均值规则相同）
+    real = client.post("/api/v1/readings/batch", json={"readings": dup})
+    replay = real.json()["summaries"][0]["replay"]
+    assert replay["version"] == body["preview"]["version"]
+    assert replay["segments"] == body["preview"]["segments"]
+
+
+def test_preview_merges_duplicates_within_request(client, db):
+    client.post("/api/v1/readings/batch", json={"readings": [
+        _reading("CASE-W", "2026-09-01T08:00:00+08:00", 20.0, 55.0),
+        _reading("CASE-W", "2026-09-01T08:10:00+08:00", 20.0, 55.0),
+        _reading("CASE-W", "2026-09-01T08:20:00+08:00", 20.0, 55.0),
+    ]})
+    version_before = db.get(CaseState, "CASE-W").version
+
+    # 请求内同一时间戳重复 3 次：逐条累计为一条均值读数 24.0/65.0
+    dup = [
+        _reading("CASE-W", "2026-09-01T09:00:00+08:00", 23.0, 60.0),
+        _reading("CASE-W", "2026-09-01T09:00:00+08:00", 24.0, 65.0),
+        _reading("CASE-W", "2026-09-01T09:00:00+08:00", 25.0, 70.0),
+    ]
+    r = client.post("/api/v1/replay/preview",
+                    params={"device_sn": "CASE-W"}, json={"readings": dup})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["added_readings"] == 3
+    assert body["changed"] is True
+    # 3 条库内 + 1 条合并后的新时间戳
+    assert body["preview"]["sample_count"] == 4
+    seg = body["preview"]["segments"][0]
+    assert seg["mean_temperature"] == pytest.approx(21.0)
+    assert seg["mean_humidity"] == pytest.approx(57.5)
+
+    # 重复预览结果稳定，且库内读数与版本号不变
+    again = client.post("/api/v1/replay/preview",
+                        params={"device_sn": "CASE-W"}, json={"readings": dup}).json()
+    assert again["preview"]["segments"] == body["preview"]["segments"]
+    db.expire_all()
+    assert db.query(Reading).filter(Reading.device_sn == "CASE-W").count() == 3
+    assert db.get(CaseState, "CASE-W").version == version_before
+
+    # 预览应与真实入库重放结果一致
+    real = client.post("/api/v1/readings/batch", json={"readings": dup})
+    replay = real.json()["summaries"][0]["replay"]
+    assert replay["version"] == body["preview"]["version"]
+    assert replay["segments"] == body["preview"]["segments"]
