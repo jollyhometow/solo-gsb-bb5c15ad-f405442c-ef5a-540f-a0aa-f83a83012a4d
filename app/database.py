@@ -157,4 +157,8 @@ class CaseState(Base):
 
 
 def init_db() -> None:
+    # SQLite 文件库：确保数据目录存在（Docker 镜像已预建 /app/data，
+    # 本地裸跑或自定义 CASE_DATA_DIR 时由这里兜底）
+    if settings.DB_URL.startswith("sqlite") and ":memory:" not in settings.DB_URL:
+        settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)

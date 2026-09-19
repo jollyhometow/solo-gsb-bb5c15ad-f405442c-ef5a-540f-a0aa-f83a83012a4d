@@ -10,7 +10,15 @@ os.environ["CASE_PENALTY"] = "4.0"
 import pytest
 from fastapi.testclient import TestClient
 
-from app.database import Base, CaseState, Reading, SessionLocal, engine, init_db
+from app.database import (
+    Base,
+    CaseState,
+    Reading,
+    SegmentSnapshot,
+    SessionLocal,
+    engine,
+    init_db,
+)
 from app.main import app, get_db
 
 
@@ -326,3 +334,135 @@ def test_preview_identical_when_no_change(client):
     assert body["changed"] is False
     assert body["would_bump_version"] is False
     assert body["affected_from_ts"] is None
+
+
+# ---------- 预览合并重复读数（回归：不可变 Sample 不得被改写） ----------
+
+
+def _snapshot_rows(db, sn):
+    rows = (
+        db.query(SegmentSnapshot)
+        .filter(SegmentSnapshot.device_sn == sn)
+        .order_by(SegmentSnapshot.segment_index)
+        .all()
+    )
+    return [
+        (r.version, r.segment_index, r.start_ts, r.end_ts, r.sample_count,
+         r.mean_temperature, r.mean_humidity)
+        for r in rows
+    ]
+
+
+def test_preview_merges_duplicate_of_stored_reading(client, db):
+    payload = [
+        _reading("CASE-PD", f"2026-09-01T08:{i:02d}:00+08:00", 20.0, 55.0)
+        for i in range(0, 40, 10)
+    ]
+    client.post("/api/v1/readings/batch", json={"readings": payload})
+    version_before = db.get(CaseState, "CASE-PD").version
+    snapshots_before = _snapshot_rows(db, "CASE-PD")
+
+    # 待预览读数与库内同设备、同时间戳重复：在内存副本上累计均值，返回 200
+    body = {"readings": [_reading("CASE-PD", "2026-09-01T08:00:00+08:00", 22.0, 60.0)]}
+    r = client.post("/api/v1/replay/preview", params={"device_sn": "CASE-PD"}, json=body)
+    assert r.status_code == 200, r.text
+    preview = r.json()
+    assert preview["changed"] is True
+    # 08:00 样本合并为 (20+22)/2=21.0 / (55+60)/2=57.5；合并不新增样本
+    assert preview["preview"]["sample_count"] == 4
+    seg = preview["preview"]["segments"][0]
+    assert seg["mean_temperature"] == pytest.approx((21.0 + 20.0 * 3) / 4)
+    assert seg["mean_humidity"] == pytest.approx((57.5 + 55.0 * 3) / 4)
+    # 当前已存储分段仍保持原均值，差异对比稳定
+    assert preview["current"]["segments"][0]["mean_temperature"] == pytest.approx(20.0)
+
+    # 同样的预览重复执行，分段差异完全一致
+    again = client.post("/api/v1/replay/preview", params={"device_sn": "CASE-PD"}, json=body)
+    assert again.status_code == 200, again.text
+    assert again.json()["preview"]["segments"] == preview["preview"]["segments"]
+    assert again.json()["changed"] is True
+
+    # 库内读数、快照与版本号均未被改写
+    db.expire_all()
+    row = (
+        db.query(Reading)
+        .filter(Reading.device_sn == "CASE-PD")
+        .order_by(Reading.ts)
+        .first()
+    )
+    assert row.report_count == 1
+    assert row.temperature == pytest.approx(20.0)
+    assert row.humidity == pytest.approx(55.0)
+    assert db.get(CaseState, "CASE-PD").version == version_before
+    assert _snapshot_rows(db, "CASE-PD") == snapshots_before
+
+
+def test_preview_merges_duplicates_within_request(client, db):
+    payload = [
+        _reading("CASE-PR", f"2026-09-01T08:{i:02d}:00+08:00", 20.0, 55.0)
+        for i in range(0, 30, 10)
+    ]
+    client.post("/api/v1/readings/batch", json={"readings": payload})
+    version_before = db.get(CaseState, "CASE-PR").version
+
+    # 请求内三条读数时间戳相同：逐条累计为一条 26.0 / 80.0
+    r = client.post("/api/v1/replay/preview", params={"device_sn": "CASE-PR"}, json={
+        "readings": [
+            _reading("CASE-PR", "2026-09-01T09:00:00+08:00", 24.0, 70.0),
+            _reading("CASE-PR", "2026-09-01T09:00:00+08:00", 26.0, 80.0),
+            _reading("CASE-PR", "2026-09-01T09:00:00+08:00", 28.0, 90.0),
+        ]
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["added_readings"] == 3
+    # 三条同 ts 只合并出一个新样本：3 + 1
+    assert body["preview"]["sample_count"] == 4
+    seg = body["preview"]["segments"][0]
+    assert seg["mean_temperature"] == pytest.approx((20.0 * 3 + 26.0) / 4)
+    assert seg["mean_humidity"] == pytest.approx((55.0 * 3 + 80.0) / 4)
+
+    # 不落库：读数数量与版本号不变
+    db.expire_all()
+    assert db.query(Reading).filter(Reading.device_sn == "CASE-PR").count() == 3
+    assert db.get(CaseState, "CASE-PR").version == version_before
+
+
+def test_preview_duplicate_merge_respects_report_count(client, db):
+    # 同一时刻两次上报，库内已合并为 report_count=2 的均值 21.0 / 52.0
+    client.post("/api/v1/readings/batch", json={"readings": [
+        _reading("CASE-PC", "2026-09-01T08:00:00+08:00", 20.0, 50.0),
+        _reading("CASE-PC", "2026-09-01T08:10:00+08:00", 20.0, 55.0),
+        _reading("CASE-PC", "2026-09-01T08:20:00+08:00", 20.0, 55.0),
+    ]})
+    client.post("/api/v1/readings/batch", json={"readings": [
+        _reading("CASE-PC", "2026-09-01T08:00:00+08:00", 22.0, 54.0),
+    ]})
+
+    # 预览再补两条同 ts 读数：基于 report_count=2 逐条累计
+    # 温度 (21*2+24)/3=22 → (22*3+26)/4=23；湿度 (52*2+55)/3=53 → (53*3+61)/4=55
+    r = client.post("/api/v1/replay/preview", params={"device_sn": "CASE-PC"}, json={
+        "readings": [
+            _reading("CASE-PC", "2026-09-01T08:00:00+08:00", 24.0, 55.0),
+            _reading("CASE-PC", "2026-09-01T08:00:00+08:00", 26.0, 61.0),
+        ]
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["changed"] is True
+    assert body["preview"]["sample_count"] == 3
+    seg = body["preview"]["segments"][0]
+    assert seg["mean_temperature"] == pytest.approx((23.0 + 20.0 + 20.0) / 3)
+    assert seg["mean_humidity"] == pytest.approx(55.0)
+
+    # 库内合并结果保持 report_count=2，不被预览推进
+    db.expire_all()
+    row = (
+        db.query(Reading)
+        .filter(Reading.device_sn == "CASE-PC")
+        .order_by(Reading.ts)
+        .first()
+    )
+    assert row.report_count == 2
+    assert row.temperature == pytest.approx(21.0)
+    assert row.humidity == pytest.approx(52.0)
